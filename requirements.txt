@@ -1,6 +1,7 @@
 fastapi
 uvicorn[standard]
 python-dotenv
+typing-extensions
 gdown
 pandas
 numpy
