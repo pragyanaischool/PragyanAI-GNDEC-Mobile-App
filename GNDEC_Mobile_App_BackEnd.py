@@ -1,6 +1,7 @@
 import os
 import gdown
 import logging
+from typing import List, Dict
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -26,17 +27,16 @@ EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "sentence-transformers/
 LLM_MODEL_NAME = os.getenv("LLM_MODEL_NAME", "llama-3.1-70b-versatile")
 PDF_OUTPUT_PATH = "data/PragyanAI_3Year_MCP_Program_Brochure_GNDEC.pdf"
 FAISS_INDEX_PATH = "faiss_index"
+MAX_HISTORY_LENGTH = 50 # Maximum number of messages to store
 
 # --- Application Setup ---
 app = FastAPI(
     title="PragyanAI Backend (Enhanced)",
-    description="An enhanced API for the PragyanAI GNDEC mobile app with improved logging, caching, and async support.",
-    version="1.1.0"
+    description="An enhanced API for the PragyanAI GNDEC mobile app with chat history, logging, caching, and async support.",
+    version="1.2.0"
 )
 
 # --- CORS Configuration ---
-# In production, you should restrict this to your frontend's domain for security.
-# For example: allow_origins=["https://your-frontend-app-name.onrender.com"]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -46,8 +46,12 @@ app.add_middleware(
 )
 
 # --- Global State ---
-# This dictionary holds our loaded QA chain to avoid reloading on every request.
-state = {"qa_chain": None, "rag_status": "uninitialized"}
+# This dictionary holds our loaded QA chain and chat history.
+state = {
+    "qa_chain": None,
+    "rag_status": "uninitialized",
+    "chat_history": [] # New: Store chat history here
+}
 
 # --- RAG Pipeline Setup ---
 def setup_rag_pipeline():
@@ -64,10 +68,8 @@ def setup_rag_pipeline():
         return None
 
     try:
-        # Ensure data directory exists
         os.makedirs(os.path.dirname(PDF_OUTPUT_PATH), exist_ok=True)
         
-        # 1. Download PDF if it doesn't exist
         if not os.path.exists(PDF_OUTPUT_PATH):
             logging.info(f"Downloading brochure (ID: {PDF_FILE_ID}) to {PDF_OUTPUT_PATH}...")
             gdown.download(id=PDF_FILE_ID, output=PDF_OUTPUT_PATH, quiet=False)
@@ -75,33 +77,23 @@ def setup_rag_pipeline():
         else:
             logging.info(f"Brochure already exists at {PDF_OUTPUT_PATH}.")
 
-        # 2. Create Embeddings
         logging.info(f"Loading embedding model: {EMBEDDING_MODEL_NAME}")
         embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL_NAME)
 
-        # 3. Load or Create Vector Store
         if os.path.exists(FAISS_INDEX_PATH):
             logging.info(f"Loading existing FAISS index from {FAISS_INDEX_PATH}...")
-            # allow_dangerous_deserialization is required for loading FAISS indexes from untrusted sources.
-            # Since we are creating the index ourselves, this is safe.
             vectorstore = FAISS.load_local(FAISS_INDEX_PATH, embeddings, allow_dangerous_deserialization=True)
             logging.info("FAISS index loaded successfully.")
         else:
             logging.info("No FAISS index found. Creating a new one.")
-            logging.info("Loading and processing PDF for indexing...")
             loader = PyPDFLoader(file_path=PDF_OUTPUT_PATH)
             docs = loader.load()
             text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
             splits = text_splitter.split_documents(docs)
-            
-            logging.info("Creating vector store from document splits...")
             vectorstore = FAISS.from_documents(documents=splits, embedding=embeddings)
-            
-            logging.info(f"Saving new FAISS index to {FAISS_INDEX_PATH}...")
             vectorstore.save_local(FAISS_INDEX_PATH)
             logging.info("FAISS index created and saved.")
 
-        # 4. Setup LLM & Retrieval QA Chain
         logging.info(f"Setting up LLM ({LLM_MODEL_NAME}) and QA chain...")
         llm = ChatGroq(api_key=GROQ_API_KEY, model_name=LLM_MODEL_NAME)
         
@@ -124,6 +116,9 @@ def setup_rag_pipeline():
 def on_startup():
     """Event handler for application startup. Initializes the RAG pipeline."""
     state["qa_chain"] = setup_rag_pipeline()
+    # Add an initial message to the chat history
+    state["chat_history"].append({"role": "assistant", "content": "Hello! How can I help you with the program details today?"})
+
 
 # --- API Models ---
 class AskRequest(BaseModel):
@@ -140,6 +135,15 @@ class StatusResponse(BaseModel):
     rag_status: str
     version: str
 
+# New: Models for chat history
+class ChatMessage(BaseModel):
+    role: str
+    content: str
+
+class HistoryResponse(BaseModel):
+    history: List[ChatMessage]
+
+
 # --- API Endpoints ---
 @app.get("/", response_model=StatusResponse, tags=["General"])
 async def read_root():
@@ -153,8 +157,7 @@ async def read_root():
 @app.post("/ask", response_model=AskResponse, tags=["AI Assistant"])
 async def ask_question(request: AskRequest):
     """
-    Asynchronously handles a question to the RAG-based AI assistant.
-    Uses a thread pool to run the blocking LangChain call.
+    Handles a question, gets an answer from the RAG pipeline, and stores the interaction.
     """
     if state["rag_status"] != "ready" or state["qa_chain"] is None:
         raise HTTPException(
@@ -165,15 +168,33 @@ async def ask_question(request: AskRequest):
     try:
         logging.info(f"Received query: {request.query}")
         
-        # Run the blocking I/O call in a separate thread to not block the event loop
+        # Add user query to history
+        state["chat_history"].append({"role": "user", "content": request.query})
+        
         response = await run_in_threadpool(state["qa_chain"].invoke, {"query": request.query})
         
         answer = response.get("result", "Sorry, I couldn't find an answer in the document.")
         logging.info(f"Generated answer snippet: {answer[:80]}...")
+        
+        # Add assistant answer to history
+        state["chat_history"].append({"role": "assistant", "content": answer})
+
+        # Trim history if it gets too long
+        if len(state["chat_history"]) > MAX_HISTORY_LENGTH:
+            state["chat_history"] = state["chat_history"][-MAX_HISTORY_LENGTH:]
+
         return {"answer": answer}
     except Exception as e:
         logging.error(f"Error during QA chain invocation: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="An error occurred while processing your question.")
+
+@app.get("/history", response_model=HistoryResponse, tags=["AI Assistant"])
+async def get_history():
+    """
+    New Endpoint: Retrieves the current chat conversation history.
+    """
+    return {"history": state["chat_history"]}
+
 
 @app.get("/analyze", response_model=AnalyzeResponse, tags=["Dashboard"])
 async def analyze_data():
@@ -183,7 +204,6 @@ async def analyze_data():
     if not GROQ_API_KEY:
         raise HTTPException(status_code=503, detail="AI analysis is unavailable due to a missing API key.")
 
-    # Generate dummy data for the prompt
     visitors = np.random.randint(150, 400, size=30)
     total_visitors = int(np.sum(visitors))
     form_fills = (visitors * np.random.uniform(0.05, 0.15, size=30)).astype(int)
@@ -208,7 +228,6 @@ async def analyze_data():
         logging.info("Generating AI analysis for dashboard...")
         llm = ChatGroq(api_key=GROQ_API_KEY, model_name=LLM_MODEL_NAME)
         
-        # Run the blocking I/O call in a separate thread
         response = await run_in_threadpool(llm.invoke, prompt)
         
         analysis_text = response.content
