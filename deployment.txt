@@ -1,0 +1,59 @@
+Deployment Guide for Render
+Here is the process to get your backend live:
+
+Step 1: Create a New Web Service
+Log in to your Render dashboard.
+
+Click the "New +" button and select "Web Service".
+
+Step 2: Connect Your GitHub Repository
+Choose "Build and deploy from a Git repository".
+
+Connect your GitHub account if you haven't already.
+
+Select the repository that contains your backend code.
+
+Step 3: Configure the Service Settings
+This is the most important part. You need to tell Render how to build and run your Python application.
+
+Name: Give your service a unique name (e.g., pragyanai-gndec-api).
+
+Region: Choose a location (e.g., Singapore).
+
+Branch: Select the main branch of your repository (usually main or master).
+
+Runtime: Render should auto-detect Python 3.
+
+Build Command: pip install -r requirements.txt
+
+Start Command: uvicorn main:app --host 0.0.0.0 --port $PORT
+
+Step 4: Add Your Environment Variable
+Your application won't work without the GROQ_API_KEY.
+
+Scroll down to the "Advanced" section or find the "Environment" tab.
+
+Click "Add Environment Variable".
+
+Enter the key and your secret value exactly as shown below:
+
+Key: GROQ_API_KEY
+
+Value: gsk_YourSecretKeyGoesHere... (Paste your actual key from the Groq Console).
+
+Step 5: Deploy!
+Scroll to the bottom and click "Create Web Service".
+
+Render will now begin the deployment process. You can watch the logs in real-time.
+
+What to Expect on the First Deploy:
+
+It will take a few minutes.
+
+The logs will show pip install running.
+
+You will see the log messages you added, like "Downloading brochure..." and "Creating a new FAISS index...". This is normal and only happens the first time.
+
+Future deployments will be much faster because the FAISS index will be cached.
+
+Once it's done, you'll see a message indicating the service is live. Render will give you a public URL (like https://pragyanai-gndec-api.onrender.com). This is the URL you will use in your Android app to make API calls.
